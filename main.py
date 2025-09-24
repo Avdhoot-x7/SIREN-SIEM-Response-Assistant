@@ -1,8 +1,11 @@
 """FastAPI application for interacting with Elasticsearch."""
+import base64
+import io
 import os
 from copy import deepcopy
 from typing import Any, Optional
 
+import matplotlib.pyplot as plt
 from elasticsearch import Elasticsearch
 from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
@@ -52,6 +55,105 @@ class AskRequest(BaseModel):
 
     session_id: str
     query: str
+
+
+class ReportRequest(BaseModel):
+    """Model for the /report endpoint request body."""
+
+    session_id: str
+    instruction: str
+    index: str = "logs-*"
+
+
+def _build_report_search_params(instruction: str, index: str) -> tuple[dict[str, Any], str, str]:
+    """Translate a reporting instruction into Elasticsearch search parameters.
+
+    Returns the search parameters, the subject being counted, and a human-readable
+    timeframe description.
+    """
+
+    lowered = instruction.lower() if instruction else ""
+    filters: list[dict[str, Any]] = []
+
+    subject = "events"
+    if "failed login" in lowered:
+        filters.append({"term": {"event.action.keyword": "authentication_failure"}})
+        subject = "failed logins"
+
+    timeframe_description = "the selected period"
+    if "last month" in lowered:
+        filters.append(
+            {
+                "range": {
+                    "@timestamp": {
+                        "gte": "now-30d/d",
+                        "lt": "now/d",
+                    }
+                }
+            }
+        )
+        timeframe_description = "the last 30 days"
+    elif "last week" in lowered:
+        filters.append(
+            {
+                "range": {
+                    "@timestamp": {
+                        "gte": "now-7d/d",
+                        "lt": "now/d",
+                    }
+                }
+            }
+        )
+        timeframe_description = "the last 7 days"
+
+    if filters:
+        query: dict[str, Any] = {"bool": {"filter": filters}}
+    else:
+        query = {"match_all": {}}
+
+    search_params: dict[str, Any] = {
+        "index": index or "logs-*",
+        "size": 0,
+        "query": query,
+        "aggs": {
+            "per_day": {
+                "date_histogram": {
+                    "field": "@timestamp",
+                    "calendar_interval": "day",
+                    "format": "yyyy-MM-dd",
+                }
+            }
+        },
+    }
+
+    return search_params, subject, timeframe_description
+
+
+def _generate_chart_base64(buckets: list[dict[str, Any]]) -> str:
+    """Create a bar chart from aggregation buckets and return it as a base64 string."""
+
+    dates = [bucket.get("key_as_string", str(bucket.get("key", ""))) for bucket in buckets]
+    dates = [date.split("T")[0] if isinstance(date, str) else str(date) for date in dates]
+    counts = [bucket.get("doc_count", 0) for bucket in buckets]
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+
+    if counts:
+        ax.bar(dates, counts, color="#1f77b4")
+        ax.set_ylabel("Count")
+        ax.set_xlabel("Date")
+        ax.set_title("Daily counts")
+        ax.tick_params(axis="x", rotation=45, labelsize=8)
+    else:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", fontsize=12)
+        ax.axis("off")
+
+    fig.tight_layout()
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png")
+    plt.close(fig)
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode("utf-8")
 
 
 @app.get("/health")
@@ -149,6 +251,53 @@ async def ask(request: AskRequest) -> dict[str, Any]:
         "dsl": search_params,
         "results": sources,
         "explain": " ".join(explanations),
+    }
+
+
+@app.post("/report")
+async def report(request: ReportRequest) -> dict[str, Any]:
+    """Generate an aggregation report based on a natural language instruction."""
+
+    if ES_CLIENT is None:
+        return {"error": "Elasticsearch host is not configured."}
+
+    session_data = SESSION_CONTEXT.setdefault(request.session_id, {})
+
+    search_params, subject, timeframe_description = _build_report_search_params(
+        request.instruction, request.index
+    )
+    session_data["last_report_dsl"] = deepcopy(search_params)
+
+    try:
+        response = await run_in_threadpool(ES_CLIENT.search, **search_params)
+    except Exception as exc:  # noqa: BLE001 - intentionally broad to surface error message
+        return {"error": str(exc)}
+
+    aggregations = response.get("aggregations", {})
+    per_day = aggregations.get("per_day", {})
+    buckets = per_day.get("buckets", [])
+
+    total_count = sum(bucket.get("doc_count", 0) for bucket in buckets)
+    if buckets:
+        peak_bucket = max(buckets, key=lambda bucket: bucket.get("doc_count", 0))
+        peak_count = peak_bucket.get("doc_count", 0)
+        peak_date_raw = peak_bucket.get("key_as_string") or str(peak_bucket.get("key", "N/A"))
+        peak_date = peak_date_raw.split("T")[0] if isinstance(peak_date_raw, str) else str(peak_date_raw)
+    else:
+        peak_count = 0
+        peak_date = "N/A"
+
+    summary = (
+        f"Found {total_count} {subject} in {timeframe_description}. "
+        f"Peak was {peak_count} on date {peak_date}."
+    )
+
+    chart_b64 = _generate_chart_base64(buckets)
+
+    return {
+        "dsl": search_params,
+        "summary": summary,
+        "chart": chart_b64,
     }
 
 
