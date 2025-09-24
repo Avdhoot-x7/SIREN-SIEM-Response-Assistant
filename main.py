@@ -58,25 +58,62 @@ async def health() -> dict[str, str]:
 
 @app.post("/ask")
 async def ask(request: AskRequest) -> dict[str, Any]:
-    """Accept a query string and run a predefined Elasticsearch query."""
+    """Translate a natural language request into an Elasticsearch query and execute it."""
 
     if ES_CLIENT is None:
         return {"error": "Elasticsearch host is not configured."}
 
-    try:
-        response = await run_in_threadpool(
-            ES_CLIENT.search,
-            index="logs-*",
-            size=5,
-            sort=[{"@timestamp": {"order": "desc"}}],
-            query={"match_all": {}},
+    user_query = request.query or ""
+    lowered_query = user_query.lower()
+
+    filters: list[dict[str, Any]] = []
+    explanations: list[str] = []
+
+    if "failed login" in lowered_query or "suspicious login" in lowered_query:
+        filters.append({"term": {"event.action.keyword": "authentication_failure"}})
+        explanations.append(
+            "Applied authentication failure filter because the query mentioned failed or suspicious logins."
         )
+
+    if "yesterday" in lowered_query:
+        filters.append(
+            {
+                "range": {
+                    "@timestamp": {
+                        "gte": "now-1d/d",
+                        "lt": "now/d",
+                    }
+                }
+            }
+        )
+        explanations.append("Restricted results to the previous day because the query mentioned yesterday.")
+
+    if filters:
+        es_query: dict[str, Any] = {"bool": {"filter": filters}}
+    else:
+        es_query = {"match_all": {}}
+        explanations.append("No specific rule matched; returning the most recent documents.")
+
+    search_params = {
+        "index": "logs-*",
+        "size": 5,
+        "sort": [{"@timestamp": {"order": "desc"}}],
+        "query": es_query,
+    }
+
+    try:
+        response = await run_in_threadpool(ES_CLIENT.search, **search_params)
     except Exception as exc:  # noqa: BLE001 - intentionally broad to surface error message
         return {"error": str(exc)}
 
     hits = response.get("hits", {}).get("hits", [])
     sources = [hit.get("_source", {}) for hit in hits]
-    return {"results": sources}
+
+    return {
+        "dsl": search_params,
+        "results": sources,
+        "explain": " ".join(explanations),
+    }
 
 
 if __name__ == "__main__":
