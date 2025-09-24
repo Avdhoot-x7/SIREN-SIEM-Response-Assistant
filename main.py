@@ -29,6 +29,30 @@ ES_PASS_ENV = "ES_PASS"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 GEMINI_MODEL_ENV = "GEMINI_MODEL"
 
+ENTITY_MAP = {
+    "failed login": {
+        "field": "event.action.keyword",
+        "value": "authentication_failure",
+    },
+    "suspicious login": {
+        "field": "event.action.keyword",
+        "value": "authentication_failure",
+    },
+    "mfa": {"field": "event.action.keyword", "value": "mfa_challenge"},
+    "malware": {"field": "rule.name.keyword", "value": "malware_detected"},
+    "vpn": {"field": "network.transport", "value": "vpn"},
+    "dns": {"field": "event.module", "value": "dns"},
+    "process creation": {
+        "field": "event.action.keyword",
+        "value": "process_start",
+    },
+    "privilege escalation": {
+        "field": "event.action.keyword",
+        "value": "privilege_escalation",
+    },
+}
+
+
 
 def _load_env_variable(name: str) -> Optional[str]:
     """Load an environment variable.
@@ -422,6 +446,21 @@ def _resolve_timeframe_filters(
     return [], "the selected period", None
 
 
+def _is_ambiguous_query(text: str) -> bool:
+    """Return ``True`` if the query only contains vague descriptors."""
+
+    cleaned = "".join(
+        ch.lower() if ch.isalpha() or ch.isspace() else " "
+        for ch in (text or "")
+    )
+    tokens = [token for token in cleaned.split() if token]
+    if not tokens:
+        return False
+
+    ambiguous_tokens = {"unusual", "activity", "weird", "strange"}
+    return all(token in ambiguous_tokens for token in tokens)
+
+
 class AskRequest(BaseModel):
     """Model for the /ask endpoint request body."""
 
@@ -632,35 +671,92 @@ async def ask(request: AskRequest) -> dict[str, Any]:
     session_data = SESSION_CONTEXT.setdefault(session_id, {})
 
     user_query = request.query or ""
+    if _is_ambiguous_query(user_query):
+        return {
+            "error": "Ambiguous query",
+            "message": (
+                "Please clarify: do you mean failed logins, malware alerts, or VPN anomalies?"
+            ),
+        }
+
+    lowered_query = user_query.lower()
 
     mapping = await _load_index_mapping("logs-*")
 
     search_params, explanations = _rule_based_translation(session_data, user_query)
 
     if search_params is None:
-        if not GEMINI_API_KEY:
-            base_explain = " ".join(explanations).strip()
-            response: dict[str, Any] = {
-                "error": "No rule matched and GEMINI_API_KEY is not configured.",
-            }
-            if base_explain:
-                response["explain"] = base_explain
-            return response
+        entity_matches = [
+            (entity, details)
+            for entity, details in ENTITY_MAP.items()
+            if entity in lowered_query
+        ]
 
-        try:
-            translated_dsl, llm_explain = translate_with_gemini(user_query, mapping)
-        except Exception as exc:  # noqa: BLE001 - we want to surface translation errors
-            base_explain = " ".join(explanations).strip()
-            error_payload: dict[str, Any] = {
-                "error": f"Gemini translation failed: {exc}",
-            }
-            if base_explain:
-                error_payload["explain"] = base_explain
-            return error_payload
+        if entity_matches:
+            seen_pairs: set[tuple[str, str]] = set()
+            must_conditions: list[dict[str, Any]] = []
+            explained_entities: set[str] = set()
 
-        search_params = translated_dsl
-        if llm_explain:
-            explanations.append(llm_explain)
+            for entity, details in entity_matches:
+                if entity not in explained_entities:
+                    explanations.append(
+                        f"Added filter for {entity} events mentioned in the query."
+                    )
+                    explained_entities.add(entity)
+
+                pair = (details["field"], details["value"])
+                if pair in seen_pairs:
+                    continue
+
+                seen_pairs.add(pair)
+                must_conditions.append({"term": {details["field"]: details["value"]}})
+
+            timeframe_filters, _, timeframe_explanation = _resolve_timeframe_filters(
+                lowered_query
+            )
+            bool_query: dict[str, Any] = {}
+            if must_conditions:
+                bool_query["must"] = must_conditions
+            if timeframe_filters:
+                bool_query.setdefault("filter", []).extend(timeframe_filters)
+                if timeframe_explanation:
+                    explanations.append(timeframe_explanation)
+
+            if bool_query:
+                query_body: dict[str, Any] = {"bool": bool_query}
+            else:
+                query_body = {"match_all": {}}
+
+            search_params = {
+                "index": "logs-*",
+                "size": 5,
+                "sort": [{"@timestamp": {"order": "desc"}}],
+                "query": query_body,
+            }
+        else:
+            if not GEMINI_API_KEY:
+                base_explain = " ".join(explanations).strip()
+                response: dict[str, Any] = {
+                    "error": "No rule matched and GEMINI_API_KEY is not configured.",
+                }
+                if base_explain:
+                    response["explain"] = base_explain
+                return response
+
+            try:
+                translated_dsl, llm_explain = translate_with_gemini(user_query, mapping)
+            except Exception as exc:  # noqa: BLE001 - we want to surface translation errors
+                base_explain = " ".join(explanations).strip()
+                error_payload: dict[str, Any] = {
+                    "error": f"Gemini translation failed: {exc}",
+                }
+                if base_explain:
+                    error_payload["explain"] = base_explain
+                return error_payload
+
+            search_params = translated_dsl
+            if llm_explain:
+                explanations.append(llm_explain)
 
     if not isinstance(search_params, dict):
         return {"error": "Translated DSL must be an object."}
@@ -671,12 +767,9 @@ async def ask(request: AskRequest) -> dict[str, Any]:
     mapping_fields = _collect_mapping_fields(mapping)
     missing_fields = _validate_dsl_fields(search_params, mapping_fields)
     if missing_fields:
-        explain_text = " ".join(explanations).strip()
         return {
-            "error": "Fields not found in mapping: "
-            + ", ".join(sorted(missing_fields)),
-            "dsl": search_params,
-            "explain": explain_text,
+            "error": "Unknown field",
+            "suggestions": sorted(mapping_fields),
         }
 
     SESSION_CONTEXT[session_id]["last_dsl"] = deepcopy(search_params)
