@@ -1,9 +1,10 @@
 """FastAPI application for interacting with Elasticsearch."""
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from elasticsearch import Elasticsearch
 from fastapi import FastAPI
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 ES_HOST_ENV = "ES_HOST"
@@ -56,10 +57,26 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/ask")
-async def ask(request: AskRequest) -> dict[str, str]:
-    """Accept a query string and echo back a placeholder response."""
+async def ask(request: AskRequest) -> dict[str, Any]:
+    """Accept a query string and run a predefined Elasticsearch query."""
 
-    return {"message": "received", "query": request.query}
+    if ES_CLIENT is None:
+        return {"error": "Elasticsearch host is not configured."}
+
+    try:
+        response = await run_in_threadpool(
+            ES_CLIENT.search,
+            index="logs-*",
+            size=5,
+            sort=[{"@timestamp": {"order": "desc"}}],
+            query={"match_all": {}},
+        )
+    except Exception as exc:  # noqa: BLE001 - intentionally broad to surface error message
+        return {"error": str(exc)}
+
+    hits = response.get("hits", {}).get("hits", [])
+    sources = [hit.get("_source", {}) for hit in hits]
+    return {"results": sources}
 
 
 if __name__ == "__main__":
