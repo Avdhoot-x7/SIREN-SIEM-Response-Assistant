@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from elasticsearch import Elasticsearch
 from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -813,16 +813,16 @@ async def report(request: ReportRequest) -> dict[str, Any]:
 
 
 @app.post("/report/pdf")
-async def report_pdf(request: ReportRequest) -> FileResponse | dict[str, str]:
+async def report_pdf(request: ReportRequest) -> Response:
     """Generate a PDF report using the same aggregation logic as ``/report``."""
 
     if ES_CLIENT is None:
-        return {"error": "Elasticsearch host is not configured."}
+        return JSONResponse({"error": "Elasticsearch host is not configured."})
 
     try:
         payload = await _generate_report_payload(request)
     except Exception as exc:  # noqa: BLE001 - intentionally broad to surface error message
-        return {"error": str(exc)}
+        return JSONResponse({"error": str(exc)})
 
     pdf_path = _build_pdf_report(
         request.instruction,
