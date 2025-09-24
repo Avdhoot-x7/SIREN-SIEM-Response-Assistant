@@ -49,6 +49,62 @@ app = FastAPI()
 # Stores per-session context such as the last executed DSL for that session.
 SESSION_CONTEXT: dict[str, dict[str, Any]] = {}
 
+TimeframeRule = tuple[tuple[str, ...], dict[str, Any], str, str]
+
+_TIMEFRAME_RULES: tuple[TimeframeRule, ...] = (
+    (
+        ("last month",),
+        {
+            "range": {
+                "@timestamp": {
+                    "gte": "now-30d/d",
+                    "lt": "now/d",
+                }
+            }
+        },
+        "the last 30 days",
+        "Restricted results to the last 30 days because the query mentioned last month.",
+    ),
+    (
+        ("last week",),
+        {
+            "range": {
+                "@timestamp": {
+                    "gte": "now-7d/d",
+                    "lt": "now/d",
+                }
+            }
+        },
+        "the last 7 days",
+        "Restricted results to the last 7 days because the query mentioned last week.",
+    ),
+    (
+        ("yesterday",),
+        {
+            "range": {
+                "@timestamp": {
+                    "gte": "now-1d/d",
+                    "lt": "now/d",
+                }
+            }
+        },
+        "the previous day",
+        "Restricted results to the previous day because the query mentioned yesterday.",
+    ),
+)
+
+
+def _resolve_timeframe_filters(
+    lowered_text: str,
+) -> tuple[list[dict[str, Any]], str, Optional[str]]:
+    """Return filters, description, and explanation derived from timeframe keywords."""
+
+    for keywords, filter_template, description, explanation in _TIMEFRAME_RULES:
+        if any(keyword in lowered_text for keyword in keywords):
+            return [deepcopy(filter_template)], description, explanation
+
+    return [], "the selected period", None
+
 
 class AskRequest(BaseModel):
     """Model for the /ask endpoint request body."""
@@ -80,31 +136,8 @@ def _build_report_search_params(instruction: str, index: str) -> tuple[dict[str,
         filters.append({"term": {"event.action.keyword": "authentication_failure"}})
         subject = "failed logins"
 
-    timeframe_description = "the selected period"
-    if "last month" in lowered:
-        filters.append(
-            {
-                "range": {
-                    "@timestamp": {
-                        "gte": "now-30d/d",
-                        "lt": "now/d",
-                    }
-                }
-            }
-        )
-        timeframe_description = "the last 30 days"
-    elif "last week" in lowered:
-        filters.append(
-            {
-                "range": {
-                    "@timestamp": {
-                        "gte": "now-7d/d",
-                        "lt": "now/d",
-                    }
-                }
-            }
-        )
-        timeframe_description = "the last 7 days"
+    timeframe_filters, timeframe_description, _ = _resolve_timeframe_filters(lowered)
+    filters.extend(timeframe_filters)
 
     if filters:
         query: dict[str, Any] = {"bool": {"filter": filters}}
@@ -209,20 +242,11 @@ async def ask(request: AskRequest) -> dict[str, Any]:
                 "Applied authentication failure filter because the query mentioned failed or suspicious logins."
             )
 
-        if "yesterday" in lowered_query:
-            filters.append(
-                {
-                    "range": {
-                        "@timestamp": {
-                            "gte": "now-1d/d",
-                            "lt": "now/d",
-                        }
-                    }
-                }
-            )
-            explanations.append(
-                "Restricted results to the previous day because the query mentioned yesterday."
-            )
+        timeframe_filters, _, timeframe_explanation = _resolve_timeframe_filters(lowered_query)
+        if timeframe_filters:
+            filters.extend(timeframe_filters)
+            if timeframe_explanation:
+                explanations.append(timeframe_explanation)
 
         if filters:
             es_query: dict[str, Any] = {"bool": {"filter": filters}}
