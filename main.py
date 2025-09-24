@@ -2,14 +2,24 @@
 import base64
 import io
 import os
+import tempfile
 from copy import deepcopy
 from typing import Any, Optional
+from xml.sax.saxutils import escape
 
 import matplotlib.pyplot as plt
 from elasticsearch import Elasticsearch
 from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import Image as RLImage
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from starlette.background import BackgroundTask
 
 ES_HOST_ENV = "ES_HOST"
 ES_USER_ENV = "ES_USER"
@@ -162,8 +172,8 @@ def _build_report_search_params(instruction: str, index: str) -> tuple[dict[str,
     return search_params, subject, timeframe_description
 
 
-def _generate_chart_base64(buckets: list[dict[str, Any]]) -> str:
-    """Create a bar chart from aggregation buckets and return it as a base64 string."""
+def _create_chart_image_bytes(buckets: list[dict[str, Any]]) -> bytes:
+    """Create a bar chart from aggregation buckets and return it as PNG bytes."""
 
     dates = [bucket.get("key_as_string", str(bucket.get("key", ""))) for bucket in buckets]
     dates = [date.split("T")[0] if isinstance(date, str) else str(date) for date in dates]
@@ -186,7 +196,116 @@ def _generate_chart_base64(buckets: list[dict[str, Any]]) -> str:
     fig.savefig(buffer, format="png")
     plt.close(fig)
     buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode("utf-8")
+    return buffer.read()
+
+
+async def _generate_report_payload(request: ReportRequest) -> dict[str, Any]:
+    """Execute the report search and construct the reusable response payload."""
+
+    session_data = SESSION_CONTEXT.setdefault(request.session_id, {})
+
+    search_params, subject, timeframe_description = _build_report_search_params(
+        request.instruction, request.index
+    )
+    session_data["last_report_dsl"] = deepcopy(search_params)
+
+    response = await run_in_threadpool(ES_CLIENT.search, **search_params)
+
+    aggregations = response.get("aggregations", {})
+    per_day = aggregations.get("per_day", {})
+    buckets = per_day.get("buckets", [])
+
+    total_count = sum(bucket.get("doc_count", 0) for bucket in buckets)
+    if buckets:
+        peak_bucket = max(buckets, key=lambda bucket: bucket.get("doc_count", 0))
+        peak_count = peak_bucket.get("doc_count", 0)
+        peak_date_raw = peak_bucket.get("key_as_string") or str(peak_bucket.get("key", "N/A"))
+        peak_date = (
+            peak_date_raw.split("T")[0]
+            if isinstance(peak_date_raw, str)
+            else str(peak_date_raw)
+        )
+    else:
+        peak_count = 0
+        peak_date = "N/A"
+
+    summary = (
+        f"Found {total_count} {subject} in {timeframe_description}. "
+        f"Peak was {peak_count} on date {peak_date}."
+    )
+
+    chart_bytes = _create_chart_image_bytes(buckets)
+
+    return {
+        "dsl": search_params,
+        "summary": summary,
+        "buckets": buckets,
+        "chart_bytes": chart_bytes,
+    }
+
+
+def _build_report_filename(instruction: str) -> str:
+    """Create a filesystem-friendly filename for the generated report."""
+
+    cleaned = "".join(
+        char if char.isalnum() else "_" for char in (instruction or "").strip()
+    )
+    cleaned = cleaned or "report"
+    return f"report_{cleaned}.pdf"
+
+
+def _build_pdf_report(
+    instruction: str, summary: str, buckets: list[dict[str, Any]], chart_bytes: bytes
+) -> str:
+    """Create a PDF report and return the filesystem path to the generated file."""
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_file.close()
+
+    doc = SimpleDocTemplate(temp_file.name, pagesize=letter)
+    styles = getSampleStyleSheet()
+
+    elements = []
+
+    title_text = f"Report for {instruction}" if instruction else "Report"
+    elements.append(Paragraph(escape(title_text), styles["Title"]))
+    elements.append(Spacer(1, 12))
+
+    elements.append(Paragraph(escape(summary), styles["BodyText"]))
+    elements.append(Spacer(1, 12))
+
+    table_data: list[list[str]] = [["Date", "Count"]]
+    if buckets:
+        for bucket in buckets:
+            raw_date = bucket.get("key_as_string") or str(bucket.get("key", ""))
+            date = raw_date.split("T")[0] if isinstance(raw_date, str) else str(raw_date)
+            table_data.append([date, str(bucket.get("doc_count", 0))])
+    else:
+        table_data.append(["No data", "0"])
+
+    table = Table(table_data, hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+            ]
+        )
+    )
+    elements.append(table)
+    elements.append(Spacer(1, 12))
+
+    chart_stream = io.BytesIO(chart_bytes)
+    chart_stream.seek(0)
+    elements.append(RLImage(chart_stream, width=6 * inch, height=3 * inch))
+
+    doc.build(elements)
+
+    return temp_file.name
 
 
 @app.get("/health")
@@ -285,44 +404,48 @@ async def report(request: ReportRequest) -> dict[str, Any]:
     if ES_CLIENT is None:
         return {"error": "Elasticsearch host is not configured."}
 
-    session_data = SESSION_CONTEXT.setdefault(request.session_id, {})
-
-    search_params, subject, timeframe_description = _build_report_search_params(
-        request.instruction, request.index
-    )
-    session_data["last_report_dsl"] = deepcopy(search_params)
-
     try:
-        response = await run_in_threadpool(ES_CLIENT.search, **search_params)
+        payload = await _generate_report_payload(request)
     except Exception as exc:  # noqa: BLE001 - intentionally broad to surface error message
         return {"error": str(exc)}
 
-    aggregations = response.get("aggregations", {})
-    per_day = aggregations.get("per_day", {})
-    buckets = per_day.get("buckets", [])
-
-    total_count = sum(bucket.get("doc_count", 0) for bucket in buckets)
-    if buckets:
-        peak_bucket = max(buckets, key=lambda bucket: bucket.get("doc_count", 0))
-        peak_count = peak_bucket.get("doc_count", 0)
-        peak_date_raw = peak_bucket.get("key_as_string") or str(peak_bucket.get("key", "N/A"))
-        peak_date = peak_date_raw.split("T")[0] if isinstance(peak_date_raw, str) else str(peak_date_raw)
-    else:
-        peak_count = 0
-        peak_date = "N/A"
-
-    summary = (
-        f"Found {total_count} {subject} in {timeframe_description}. "
-        f"Peak was {peak_count} on date {peak_date}."
-    )
-
-    chart_b64 = _generate_chart_base64(buckets)
+    chart_b64 = base64.b64encode(payload["chart_bytes"]).decode("utf-8")
 
     return {
-        "dsl": search_params,
-        "summary": summary,
+        "dsl": payload["dsl"],
+        "summary": payload["summary"],
         "chart": chart_b64,
     }
+
+
+@app.post("/report/pdf")
+async def report_pdf(request: ReportRequest) -> FileResponse | dict[str, str]:
+    """Generate a PDF report using the same aggregation logic as ``/report``."""
+
+    if ES_CLIENT is None:
+        return {"error": "Elasticsearch host is not configured."}
+
+    try:
+        payload = await _generate_report_payload(request)
+    except Exception as exc:  # noqa: BLE001 - intentionally broad to surface error message
+        return {"error": str(exc)}
+
+    pdf_path = _build_pdf_report(
+        request.instruction,
+        payload["summary"],
+        payload["buckets"],
+        payload["chart_bytes"],
+    )
+
+    filename = _build_report_filename(request.instruction)
+    background_task = BackgroundTask(os.remove, pdf_path)
+
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=filename,
+        background=background_task,
+    )
 
 
 if __name__ == "__main__":
